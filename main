@@ -1,0 +1,1001 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "stm32f0xx.h"
+//#include "ili9328.h"
+#include "uart.h"
+#include "time.h"
+#include "led.h"
+#include "modbus.h"
+#include "hand_pack.h"
+#include "w25x16.h"
+#include "exit.h"
+#include "start.h"
+#include "stmflash.h"
+extern __IO uint32_t bComLinked;
+enum STATE
+{
+		ST_NONE,
+		ST_SEND_DGMR_REQ,
+    ST_WAIT_DGMR_RESP,    
+    ST_SEND_MASTER_REQ,
+    ST_WAIT_MASTER_RESP,
+    ST_SEND_SNR_REQ,
+    ST_WAIT_SNR_RESP,
+    ST_CHECK_SNR_TIMEOUT,
+    ST_OK,
+};
+
+struct st_run_info gRuninfo;
+ 
+#define RxBufferSize1   (countof(TxBuffer1) - 1)
+#define countof(a)      (sizeof(a) / sizeof(*(a)))
+#define  BufferSize (countof(Tx_Buffer)-1)
+
+//15K
+__IO uint16_t temp1 = 0;
+__IO uint16_t temp2 = 0;
+__IO uint32_t gRecvOK = 0;
+__IO uint32_t gRecvOK2 = 0;
+__IO uint32_t gRecvShowInfo = 0;
+struct st_config gConfig;
+
+//u32 result;
+u32 bshowDebugInfo = 0; ///ÊÇ·ñÏÔÊ¾µ÷ÊÔÐÅÏ¢
+
+uint8_t Month, Day;
+uint16_t Year;
+
+void loginfo(const char *s)
+{
+    if ( bshowDebugInfo)
+    {
+        memset(Send_Buffer, 0, sizeof(Send_Buffer));
+        sprintf(Send_Buffer, "%s", s );
+        UART2_Send(Send_Buffer, strlen(Send_Buffer));
+    }
+}
+
+
+
+void init_irq_buf(int index)
+{
+    if (index == 0)
+    {
+        Rcv_Num = 0;
+        gRecvOK = 0;
+    }
+    else
+    {
+        Rcv_Num2 = 0;
+        gRecvOK2 = 0;
+    }
+}
+
+void send_get_6600_snr()
+{
+
+    char cmd[20] = {0};
+		if(gRuninfo.isMain == 1)
+		{
+				sprintf(cmd, "AT^DAPR=1\r\n");
+				UART_Send(cmd, strlen(cmd));
+		}
+		else if(gRuninfo.isMain == 2)
+		{
+				sprintf(cmd, "AT^DRPR=1\r\n");
+				UART_Send(cmd, strlen(cmd));
+		}
+ 
+  //  printf("SDAPR=1\r\n");
+}
+void close_Lord_6600()
+{
+
+    char cmd[20] = {0};
+
+    sprintf(cmd, "AT^DAPR=0\r\n");
+    UART_Send(cmd, strlen(cmd));
+}
+void close_Slave_6600()
+{
+
+    char cmd[20] = {0};
+		
+    sprintf(cmd, "AT^DRPR=0\r\n");
+    UART_Send(cmd, strlen(cmd));
+}
+void send_get_6600_master()
+{
+    char cmd[20] = {0};
+    sprintf(cmd, "AT^DDTC?\r\n");
+    UART_Send(cmd, strlen(cmd));
+  //  printf("SDDTC?\r\n");
+
+}
+void send_get_6600_dgmr()
+{
+    char cmd[20] = {0};
+    sprintf(cmd, "AT^DGMR?\r\n");
+    UART_Send(cmd, strlen(cmd));
+		
+}
+int parse_snr_dapr(  char *sour, int len, int *snr)
+{
+    int k;
+    int i = 0;
+    char *sp = NULL;
+    char *ep = NULL;
+    char *bp[2];
+    int r = -0xFFF0;
+    bp[0] = strstr(sour, "^DAPRI:");
+    bp[1] = strstr(sour + 6, "^DAPRI:");
+    snr[0] = -0xFFFF;
+    snr[1] = -0xFFFF;
+    if (bp[0] == NULL)
+    {
+        return r;
+    }
+    for(k = 0; k < 2; k++)
+    {
+        sp = NULL;
+        ep = NULL;
+        if (bp[k]) //????6?,??????
+        {
+            for( i = 0; i < 6; i++)
+            {
+                sp = strstr(bp[k], ",");
+                if (sp)
+                {
+                    *sp = ';';
+                }
+            }
+        }
+
+        if (sp)
+        {
+            sp += 2; //??;" 2???
+            ep = strstr(sp, "\""); //?????"?
+            if (ep)
+            {
+                *ep = 0;
+                snr[k] = atoi(sp);
+            }
+        }
+    }
+    //    Form1->mmo1->Lines->Add(sp);
+    r = (snr[0] > snr[1]) ? snr[0] : snr[1];
+    return r;
+}
+
+int parse_snr_drpr(  char *sour, int len, int *snr)
+{
+    int k = 0;
+    int i = 0;
+    char *sp;
+    char *ep;
+    int r = -0xFFF0;
+    char *bp[2];
+    bp[0] = strstr(sour, "^DRPRI:");
+    bp[1] = strstr(sour + 6, "^DRPRI:");
+    snr[0] = -0xFFFF;
+    snr[1] = -0xFFFF;
+
+    if (bp[0] == NULL)
+    {
+        return r;
+    }
+    for(k = 0; k < 2; k++)
+    {
+        sp = NULL;
+        ep = NULL;
+        if (bp[k]) //????7?,??????
+        {
+            for( i = 0; i < 7; i++)
+            {
+                sp = strstr(bp[k], ",");
+                if (sp)
+                {
+                    *sp = ';';
+                }
+            }
+        }
+
+        if (sp)
+        {
+            sp += 2; //??;" 2???
+            ep = strstr(sp, "\""); //?????"?
+            if (ep)
+            {
+                *ep = 0;
+                snr[k] = atoi(sp);
+            }
+
+        }
+    }
+    //    Form1->mmo1->Lines->Add(sp);
+
+    r = (snr[0] > snr[1]) ? snr[0] : snr[1];
+//		printf("%d,%d,%d\n",snr[0],snr[1],r);
+    return r;
+}
+
+
+
+#define MAX_CMD_COUNT 11
+const char InputBTCmd[MAX_CMD_COUNT][15] = {"^FREQ", "^IP", "^POWER", "^HOPP", "^TDD", "^MASTER", "^PW", "^STATE", "^COMSPEED","^SPOWER"};
+const char Replace6600_QueryCmd[MAX_CMD_COUNT][15] = {"^DAOCNDI", "^NETIFCFG", "^DRPS", "^DFHC", "^DSTC", "^DDTC", "^DAPI", "^DACS", "^DUBR","^DSSMTP"};
+//DFHC=ÌøÆµ DSTC=TDD  DDTC=½ÓÈëÀàÐÍ MASTER  DAPI=ÃÜÔ¿ PW  DACS=×´Ì¬ STATE
+//	const char Replace6600_SetCmd[MAX_CMD_COUNT][20]={"^DAOCNDI","^NETIFCFG=2,"};
+
+void mydate(uint16_t *Year, uint8_t *Month, uint8_t *Day)
+{
+		const char *pMonth[] = {"Jua", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+		const char Date[12] = __DATE__;
+		uint8_t i;
+
+		for(i = 0; i < 12; i++)if(memcmp(Date, pMonth[i], 3) == 0)*Month = i + 1, i = 12;
+		*Year = (uint16_t)atoi(Date + 7)-1; 
+		*Day = (uint8_t)atoi(Date + 4);
+}
+void send_standard_at_reponse(int bsucc)
+{
+    char succ_cmd[] = {"\r\nOK\r\n"};
+    char fail_cmd[] = {"\r\nERROR\r\n"};
+    if (bsucc)
+    {
+        UART2_Send(succ_cmd, strlen(succ_cmd));
+    }
+    else
+    {
+        UART2_Send(fail_cmd, strlen(fail_cmd));
+    }
+
+}
+int proc_bt_cmd(const  char *sour, int len, char *newcmd, int *newlen)
+{
+
+    char *param;
+    int temp;
+    char *bp;
+    int i, j,k;
+    *newlen=0;
+    bp = strstr(sour, "BT^SNR");
+    if (bp )
+    {
+        param = strstr(bp, "=");
+        param++;
+        temp = atoi(param);
+        if (temp == 1)
+        {
+            gRuninfo.bOutputSNR = 1;
+        }
+        else if (temp == 0)
+        {
+            gRuninfo.bOutputSNR = 0;
+        }
+        send_standard_at_reponse(1);
+        return 1;
+    }
+		
+		 bp = strstr(sour, "BT^LED");
+    if (bp )
+    {
+        param = strstr(bp, "=");
+			if (param)  //0=OFF,1=Red,2=Yellow ,3=Green;
+			{
+        param++;
+        temp = atoi(param);
+				sprintf(newcmd, "\r\n^LED:%d\r\n\r\nOK\r\n", temp);
+				switch (temp)
+				{
+					case	3:
+						{	
+						LEDG_Open();
+						LEDR_Close();
+						sprintf(newcmd, "\r\n^LED:%d,Green\r\n\r\nOK\r\n", temp);
+						}
+						break;
+					case	2:
+					{
+							LEDG_Open();
+							LEDR_Open();
+							sprintf(newcmd, "\r\n^LED:%d,Yellow\r\n\r\nOK\r\n", temp);
+					}
+					break;
+					case 1:
+					{
+							LEDG_Close();
+							LEDR_Open();
+							sprintf(newcmd, "\r\n^LED:%d,Red\r\n\r\nOK\r\n", temp);
+					}
+					break;
+					case 0:
+					{
+							LEDG_Close();
+							LEDR_Close();
+							sprintf(newcmd, "\r\n^LED:%d,Close\r\n\r\nOK\r\n", temp);
+					}
+					break;
+					default:
+						sprintf(newcmd, "\r\n^LED:%d\r\n\r\nERROR\r\n", temp);
+						break;
+				}//end case
+				UART2_Send(newcmd, strlen(newcmd));
+	      return 1;
+			}
+    }
+		
+		bp = strstr(sour, "BT^FIXPOWER");
+    if (bp )
+    {
+			  param = strstr(bp, "?");
+			 if (param)
+			 {
+				 sprintf(newcmd, "\r\n^FIXPOWER:%d\r\n\r\nOK\r\n", gConfig.fix_power);
+					UART2_Send(newcmd, strlen(newcmd));
+				  return 1;
+			 }
+        param = strstr(bp, "=");
+        param++;
+        gConfig.fix_power = atoi(param);
+			  save_config((const unsigned char *)&gConfig, sizeof(gConfig));
+        send_standard_at_reponse(1);
+        return 0;
+    }
+		
+		bp = strstr(sour, "BT^QUERY");
+		if (bp)
+		{
+				param = strstr(bp, "=");
+				if (param)
+				{
+						param++;
+						temp = atoi(param);
+						if (temp == 1)
+						{
+							 if(gRuninfo.isMain == 1)
+							 {
+									close_Lord_6600();
+							 }
+							 else if(gRuninfo.isMain == 2)
+							 {
+									close_Slave_6600();
+							 }
+						 }
+							
+						else if (temp == 0)
+						{
+								if(gRuninfo.isMain == 1)
+							 {
+									send_get_6600_snr();
+							 }
+							 else if(gRuninfo.isMain == 2)
+							 {
+									send_get_6600_snr();
+							 }
+						 }
+							sprintf(newcmd, "\r\n^QUERY:%d\r\n\r\nOK\r\n",temp);
+							UART2_Send(newcmd, strlen(newcmd));
+							return 0;
+					}
+				}
+    bp = strstr(sour, "BT^VER");
+    if (bp)
+    {
+        param = strstr(bp, "?");
+        if (param)
+        {
+					  mydate(&Year, &Month, &Day);
+            if(Month<10 && Day<10 )
+						{	
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d0%d0%d\r\n", Year, Month, Day);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else if (Month<10 && Day>10)
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d0%d%d\r\n", Year, Month, Day);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else if (Month>10 && Day<10)
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d%d0%d\r\n", Year, Month, Day);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d%d%d\r\n", Year, Month, Day);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+        }
+				return 0;
+		}
+		bp = strstr(sour, "BT^DGMR");
+    if (bp)
+    {
+        param = strstr(bp, "?");
+        if (param)
+        {
+					  mydate(&Year, &Month, &Day);
+            if(Month<10 && Day<10 )
+						{	
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d0%d0%d(%s)\r\n", Year, Month, Day, gRuninfo.DGMR);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else if (Month<10 && Day>10)
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d0%d%d(%s)\r\n", Year, Month, Day, gRuninfo.DGMR);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else if (Month>10 && Day<10)
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d%d0%d(%s)\r\n", Year, Month, Day, gRuninfo.DGMR);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+						else
+						{
+							sprintf(newcmd, "\r\n^VER:BTD1012_V1.0_%d%d%d(%s)\r\n", Year, Month, Day, gRuninfo.DGMR);
+							UART2_Send(newcmd, strlen(newcmd));
+						}
+        }
+				return 0;
+		}
+    bp = strstr(sour, "BT^SIGNAL");
+    if (bp)
+    {
+        param = strstr(bp, "?");
+        if (param)
+        {
+            //query
+            sprintf(newcmd, "\r\n^SIGNAL:%d,%d,%d\r\n\r\nOK\r\n", gConfig.high, gConfig.low,gConfig.isComLinked);
+            UART2_Send(newcmd, strlen(newcmd));
+
+        }
+        param = strstr(sour, "=");
+        if (param)
+        {
+            //set
+            param++;
+					i=0;
+					j=0;
+					k=0;
+            sscanf(param, "%d,%d,%d", &i, &j,&k);
+            gConfig.high = i;
+            gConfig.low = j;
+					  gConfig.isComLinked=k;
+            save_config((const unsigned char *)&gConfig, sizeof(gConfig));
+            send_standard_at_reponse(1);
+
+        }
+        return 0;
+    }
+
+    bp = strstr(sour, "BT^DEBUG");
+    if (bp)
+    {
+        param = strstr(bp, "=");
+        if (param)
+        {
+            param++;
+						temp = atoi(param);
+            if (temp==1)
+            {
+                bComLinked = 1;
+            }
+            else if (temp==0)
+            {
+                bComLinked = 0;
+            }
+        }
+				return 0;
+    }
+
+
+    bp = strstr(sour, "BT^MORE");
+    if (bp)
+    {
+        param = strstr(bp, "=");
+        if (param)
+        {
+            //set
+					  param++;
+						temp = atoi(param);
+            if (temp==1)
+            {
+                bshowDebugInfo = 1;
+            }
+            if (temp==0)
+            {
+                bshowDebugInfo = 0;
+            }
+        }
+				return 0;
+    }
+    for(  i = 0; i < MAX_CMD_COUNT; i++)
+    {
+        bp = strstr(sour, InputBTCmd[i]);
+        if (bp)
+        {
+            if (strstr(bp, "?"))
+            {
+                //query
+                sprintf(newcmd, "AT%s?\r\n", Replace6600_QueryCmd[i]);
+                *newlen = strlen(newcmd);
+                return 1;
+            }
+            else  	if (strstr(bp, "="))
+            {
+                //set
+                //	if (param)
+                {
+                    param = strstr(bp, "=");
+                    if (i == 1) //IP set is not normal
+                    {
+                        param++;
+                        sprintf(newcmd, "AT%s=2,%s\r\n", Replace6600_QueryCmd[i], param);
+                    }
+                    else
+                    {
+                        sprintf(newcmd, "AT%s%s\r\n", Replace6600_QueryCmd[i], param);
+                    }
+                    *newlen = strlen(newcmd);
+#if 1
+                    memset(Send_Buffer, 0, sizeof(Send_Buffer));
+                    sprintf(Send_Buffer, "AT+CFUN=0\r\n");
+                    UART_Send(Send_Buffer, strlen(Send_Buffer));
+										
+                    delay(0x10000); //0x10000
+#endif
+                    return 1;
+                }
+            }
+
+        }
+    }
+
+
+    ///×îºóÔÙ´¦Àíbt»ØÓ¦ÃüÁî
+    bp = strstr(sour, "BT");
+    if (bp)
+    {
+        sprintf(newcmd, "\r\nOK\r\n");
+        UART2_Send(newcmd, strlen(newcmd));
+        return 0;
+    }
+
+    send_standard_at_reponse(0);
+    return 0;
+}
+
+int proc_6600_cmd(const  char *sour, int len, char *newcmd, int *newlen)
+{
+    int r = 0;
+    char *bp;
+    int i;
+    char *param;
+	  *newlen=0;
+    for(i = 0; i < MAX_CMD_COUNT; i++)
+    {
+        bp = strstr(sour, Replace6600_QueryCmd[i]);
+        param = strstr(sour, ":");
+
+        if (bp && param)
+        {
+            sprintf(newcmd, "%s%s", InputBTCmd[i], param);
+            *newlen = strlen(newcmd);
+            r = 1;
+            return r;
+        }
+    }
+
+    return r;
+}
+
+
+int proc_snr(char *buf, int recvlen)
+{
+    int snr[2];
+    int snr_r;
+	 
+    snr_r = parse_snr_drpr(buf, recvlen, snr);
+    if (snr_r == -0xFFF0) //Ã»ÓÐÕÒµ½,¼ÌÐø±È½Ï
+    {
+        snr_r = parse_snr_dapr(buf, recvlen, snr);
+    }
+    if (snr_r == -0xFFF0)
+    {
+        ///FFF0 ±íÊ¾Ã»ÓÐÊÕµ½,Ö±½ÓÍË³ö
+        return snr_r;
+    }
+
+	
+    if (snr_r == -0xFFFF)
+    {
+        //»ñÈ¡snrÊ§°Ü
+      //  LEDR_Close();
+      //  LEDG_Close();
+    }
+    else if (snr_r >= gConfig.high)
+    {
+        LEDG_Open();
+        LEDR_Close();
+        loginfo("SNR in High\r\n");
+
+    }
+    else if (snr_r >= gConfig.low)
+    {
+        LEDG_Open();
+        LEDR_Open();
+        loginfo("SNR in Medium\r\n");
+    }
+    else  if (snr_r < gConfig.low)
+    {
+        LEDG_Close();
+        LEDR_Open();
+        loginfo("SNR in Low\r\n");
+    }
+    else
+    {
+        // 	 LEDG_Close();
+        //	 LEDR_Close();
+        loginfo("SNR Not proceed\r\n");
+    }
+    return snr_r;
+}
+int isDDTC_Resp(const char *buf, int len)
+{
+    char *bp = strstr(buf, "^DDTC");
+    char *param = strstr(buf, ":");
+    int r = 0;
+    if (bp && param)
+    {
+        gRuninfo.bRecvMaster = 1;
+        param++;
+        gRuninfo.isMain = atoi(param);
+        printf("IsMain:%d\r\n", gRuninfo.isMain);
+        r = 1;
+    }
+    return r;
+}
+int isDGMR_Resp(const char *buf, int len)
+{
+    char *bp = strstr(buf, "^DGMR");
+    char *param = strstr(buf, ":");
+		char *p;
+		int  r = 0;
+    if (bp && param)
+    { 
+				if(strstr(param,"\r"));
+					{	
+						p = strstr(param, "\r");
+						p--;
+						*p = '\0';
+						strncpy(gRuninfo.DGMR,param+9,sizeof(gRuninfo.DGMR));   //"LC6600_1.00.00_R20_20180824"
+						r = 1;
+					}
+    }
+    return r;
+}
+void show_signal_led(int temp)
+{ 
+		char newcmd[50]={0};
+		switch (temp)
+				{
+					case	3:
+						{	
+						LEDG_Open();
+						LEDR_Close();
+						sprintf(newcmd, "LED:%d,Green\r\n", temp);
+						}
+						break;
+					case	2:
+					{
+							LEDG_Open();
+							LEDR_Open();
+							sprintf(newcmd, "LED:%d,Yellow\r\n", temp);
+					}
+					break;
+					case 1:
+					{
+							LEDG_Close();
+							LEDR_Open();
+							sprintf(newcmd, "LED:%d,Red\r\n", temp);
+					}
+					break;
+					case 0:
+					{
+							LEDG_Close();
+							LEDR_Close();
+							sprintf(newcmd, "LED:%d,Close\r\n", temp);
+					}
+						
+				}
+	if (newcmd[0]!=0)	
+	{
+		 printf(newcmd);
+	}		
+}
+
+int main(void)
+{
+    char newcmd[100];
+    int newlen;
+    enum STATE atState = ST_NONE;
+    int snr;
+    //  int hasRecvSNR = 0;
+    int is_recv_bt_cmd = 0; ///ÊÇ·ñÊÕµ½ÒÔBT^¿ªÍ·µÄÃüÁî
+    /* ³õÊ¼»¯*/
+    SystemInit();
+
+//	  int Year,Month,Day;
+    LED_Init();
+    LEDG_Close();
+    LEDR_Close();
+    LED_Signal_Close();
+
+    run_watch_dog();
+
+    gRuninfo.bOutputSNR = 0;
+
+
+    set_start_cfg();
+   // TIM3_Int_Init(1000, 16000);
+    TIM3_Int_Init(500, 8000);
+
+    IWDG_ReloadCounter();
+    //	printf("APP:%s,%s\r\n", __DATE__,__TIME__);
+
+    memset(newcmd, 0, sizeof(newcmd));
+		mydate(&Year, &Month, &Day);
+    sprintf(newcmd, "APP:%d %d %d %s\r\n", Year ,Month ,Day , __TIME__);
+    //	sprintf(newcmd,"APPBEGIN\r\n");
+    UART2_Send(newcmd, strlen(newcmd));
+    //	IWDG_ReloadCounter();
+
+ //Èç¹ûÅäÖÃ¶ÁÈ¡µ½Ö±Í¨Ä£Ê½Îª1,ÄÇÃ´¾ÍÉèÖÃÎªÖ±Í¨Ä£Ê½
+  if (gConfig.isComLinked==1)
+	{
+		bComLinked=1;
+	}
+	gRuninfo.bInQueryState=0;
+#if 0
+    sprintf((char *)Send_Buffer, "%s", "1234567890");
+    while(1)
+    {
+        if (temp1 == 1)
+        {
+            LEDG_Toggle();
+            LEDR_Toggle();
+            LED_Signal_Toggle();
+            //	delay(0x1FFFFF);
+            // 	UART_Send(Send_Buffer, 8);
+            UART2_Send(Send_Buffer, 8);
+            temp1 = 0;
+        }
+        IWDG_ReloadCounter();
+    }
+#endif
+
+    gRuninfo.bRecvMaster = 0;
+    //µÈ´ý6600Æô¶¯ºÃ
+    temp1 = 0;
+		
+	if (gConfig.isComLinked==1)
+	{
+   LED_Signal_Open(); //³£ÁÁµÆ
+	}
+		
+    for(snr = 0; snr < 5; snr++)
+    {
+        while(temp1 <= 2)
+        {
+					  
+            IWDG_ReloadCounter();
+        }
+				show_signal_led(snr); //×´Ì¬µÈÒÀ´ÎµãÁÁ
+        temp1 = 0;
+       // printf("W\r\n");
+    }
+		show_signal_led(0);
+    temp1 = 0;
+    snr = 0;
+
+    while (1)
+    {
+        if (gRecvShowInfo)
+        {
+            printf("[%d,%d],%d,%d\r\n", temp1, temp2, atState, gRuninfo.bRecvMaster);
+            gRecvShowInfo = 0;
+            bshowDebugInfo = 1;
+        }
+
+        if (temp2 >= 1)
+        {
+            if (gRuninfo.bRecvMaster)
+            {
+                if (gRuninfo.isMain == 1)
+                {
+                    LED_Signal_Close();
+                    LED_Signal_Open();
+                    LED_Signal_Open();
+                }
+                else 	 if (gRuninfo.isMain == 2)
+                {
+                    LED_Signal_Toggle();
+                }
+
+            }
+            temp2 = 0;
+        }
+
+
+        if (!bComLinked)
+				{
+            switch(atState)
+            {
+            case ST_NONE:
+                if (gRecvOK)
+                {
+                    {
+                        printf("Begin\r\n");
+                        atState = ST_SEND_MASTER_REQ;
+                        temp1 = 0;
+                    }
+                    init_irq_buf(0);
+
+                }
+                break;
+            case ST_SEND_MASTER_REQ://³õÊ¼×´Ì¬
+                send_get_6600_master();
+                atState = ST_WAIT_MASTER_RESP;
+                temp1 = 0;
+                break;
+            case ST_WAIT_MASTER_RESP:
+                if (gRecvOK)
+                {
+                    if (isDDTC_Resp(Rcv_Buffer, Rcv_Num))
+                    {
+                        atState = ST_SEND_DGMR_REQ;
+                        temp1 = 0;
+                    }
+                    init_irq_buf(0);
+                }
+                if (temp1 >= 4)  //1Ãë
+                {
+                    atState = ST_SEND_MASTER_REQ; //³¬Ê±,ÖØ¸´·¢ËÍAt^ddtc?
+                    temp1 = 0;
+                    loginfo("IN ST_WAIT_MASTER_RESP\r\n");
+
+                }
+                break;
+						case ST_SEND_DGMR_REQ://dgmr³õÊ¼×´Ì¬
+                send_get_6600_dgmr();
+                atState = ST_WAIT_DGMR_RESP;
+                temp1 = 0;
+                break;
+            case ST_WAIT_DGMR_RESP:
+                if (gRecvOK)
+                {
+                    if (isDGMR_Resp(Rcv_Buffer, Rcv_Num))
+                    {
+                        atState = ST_SEND_SNR_REQ;
+                        temp1 = 0;
+                    }
+                    init_irq_buf(0);
+                }
+                if (temp1 >= 4)  //1Ãë
+                {
+                    atState = ST_SEND_DGMR_REQ; //³¬Ê±,ÖØ¸´·¢ËÍAt^dgmr?
+                    temp1 = 0;
+                    loginfo("IN ST_WAIT_DGMR_RESP\r\n");
+										
+                }
+                break;
+            case ST_SEND_SNR_REQ:
+                send_get_6600_snr();
+                atState = ST_WAIT_SNR_RESP;
+                temp1 = 0;
+                break;
+            case ST_WAIT_SNR_RESP:					
+	               if (temp1 >= 4)   //
+                {
+                    atState = ST_SEND_SNR_REQ; //³¬Ê±,ÖØ¸´·¢ËÍAt^dapr=1
+                    temp1 = 0;
+                    loginfo("IN ST_WAIT_SNR_RESP\r\n");
+
+                }
+                break;
+            case ST_CHECK_SNR_TIMEOUT:
+            {
+                if (temp1 > 4)
+                {
+								if (gRuninfo.bInQueryState==0)
+									{
+                    loginfo("In ST_CHECK_SNR_TIMEOUT\r\n" );
+                    LEDG_Close();
+                    LEDR_Close();
+									}
+                    temp1 = 0;
+                }
+            }
+            break;
+            } //end switch
+}
+
+        if (gRecvOK) ///ÊÕµ½6600µÄÊý¾Ý
+        {
+            //  printf("R:%s\r\n",Rcv_Buffer);
+            newlen = 0;
+            memset(newcmd, 0, sizeof(newcmd));
+				if (gRuninfo.bInQueryState==0) //²»ÊÇÔÚ²éÑ¯×´Ì¬
+					{
+            snr = proc_snr(Rcv_Buffer, Rcv_Num);
+					}
+					else
+					{
+						snr = -0xFFF0;
+					}
+            if (snr == -0xFFF0)
+            {
+
+                isDDTC_Resp(Rcv_Buffer, Rcv_Num); 
+
+                if (proc_6600_cmd(Rcv_Buffer, Rcv_Num, newcmd, &newlen)) ///´¦ÀíÖÐÍ¾ÐÞ¸ÄµÄÇé¿ö
+                {
+                    if ((newlen > 0) && is_recv_bt_cmd)
+                    {
+										//	printf("R[%d]:%s->S[%d]:%s\n",Rcv_Num,Rcv_Buffer,newlen,newcmd);
+                        UART2_Send(newcmd, newlen);
+                        is_recv_bt_cmd = 0;
+                    }
+                }
+                else
+                {
+                    //Èç¹û²»ÐèÒªÌæ»»µÄ»°,ÆäËûµÄ¶¼Ö±½Ó·¢ÍùÍâ²¿´®¿Ú
+                    if (is_recv_bt_cmd)
+                    {
+											   Rcv_Buffer[Rcv_Num]=0;
+										  //	printf("R2[%d]:%s\n",Rcv_Num,Rcv_Buffer);
+                        UART2_Send(Rcv_Buffer, Rcv_Num);
+                        is_recv_bt_cmd = 0;
+                    }
+                }
+            }
+            else
+            {
+                atState = ST_CHECK_SNR_TIMEOUT; //ÓÃÓÚÖ¸Ê¾,²»ÐèÒªÔÙ·¢at^drprÃüÁîÁË
+                loginfo("Recv SNR,ST_CHECK_SNR_TIMEOUT\r\n");
+                temp1 = 0;
+                //   hasRecvSNR = 1;
+            }
+
+
+            init_irq_buf(0);
+
+        }
+        if (gRecvOK2) ///¶ÔÍâµÄÊý¾Ý¿ÚÊÕµ½¶«Î÷
+        {
+            newlen = 0;
+            memset(newcmd, 0, sizeof(newcmd));
+            proc_bt_cmd(Rcv_Buffer2, Rcv_Num2, newcmd, &newlen);
+            if (newlen > 0)
+            {
+
+							
+                UART_Send(newcmd, newlen);
+#if 0
+                sprintf(Send_Buffer, "SENDAT:%s", newcmd);
+                UART2_Send(Send_Buffer, strlen(Send_Buffer));
+#endif
+                is_recv_bt_cmd = 1; //ÊÕµ½BTÖ±Á¬,±ä»»Ö®ºó,·¢Ïò6600
+                // UART2_Send(newcmd, Rcv_Num2);
+							 
+            }
+            init_irq_buf(1);
+
+        }
+
+			
+        IWDG_ReloadCounter();  								// ´ÓÐÂµ¼ÈëIWDG¼ÆÊýÆ÷
+    }
+}
